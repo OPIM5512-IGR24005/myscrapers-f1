@@ -186,17 +186,85 @@ def _vertex_extract_fields(raw_text: str) -> dict:
             "make": {"type": "string", "nullable": True},
             "model": {"type": "string", "nullable": True},
             "mileage": {"type": "integer", "nullable": True},
+                    # A07: 18 new fields
+            "trim": {"type": "string", "nullable": True},
+            "body_type": {
+                "type": "string", "nullable": True,
+                "enum": ["sedan", "suv", "truck", "coupe", "convertible",
+                         "hatchback", "wagon", "minivan", "van", "other"]
+            },
+            "drivetrain": {
+                "type": "string", "nullable": True,
+                "enum": ["fwd", "rwd", "awd", "4wd"]
+            },
+            "transmission": {
+                "type": "string", "nullable": True,
+                "enum": ["automatic", "manual"]
+            },
+            "fuel_type": {
+                "type": "string", "nullable": True,
+                "enum": ["gas", "diesel", "hybrid", "electric"]
+            },
+            "exterior_color": {
+                "type": "string", "nullable": True,
+                "enum": ["black", "white", "silver", "gray", "blue", "red",
+                         "green", "brown", "beige", "gold", "yellow",
+                         "orange", "purple", "other"]
+            },
+            "title_status": {
+                "type": "string", "nullable": True,
+                "enum": ["clean", "rebuilt", "salvage", "lien",
+                         "missing", "parts only"]
+            },
+            "condition": {
+                "type": "string", "nullable": True,
+                "enum": ["new", "like new", "excellent", "good",
+                         "fair", "salvage"]
+            },
+            "leather_seats": {"type": "boolean", "nullable": True},
+            "city": {"type": "string", "nullable": True},
+            "sunroof": {"type": "boolean", "nullable": True},
+            "backup_camera": {"type": "boolean", "nullable": True},
+            "heated_seats": {"type": "boolean", "nullable": True},
+            "navigation": {"type": "boolean", "nullable": True},
+            "num_owners": {"type": "integer", "nullable": True},
+            "accident_history": {"type": "boolean", "nullable": True},
+            "cylinders": {"type": "integer", "nullable": True},
+            "needs_repair": {"type": "boolean", "nullable": True},
         },
         "required": ["price", "year", "make", "model", "mileage"]
     }
 
     # System instruction (will be prepended to the prompt)
     sys_instr = (
-        "Extract ONLY the following fields from the input text. "
-        "Return a strict JSON object that conforms to the provided schema. "
-        "If a value is not present, use null. "
-        "Rules: integers for price/year/mileage; price in USD; mileage in miles; "
-        "do not infer values not explicitly present; do not add extra keys."
+        "Extract ONLY the fields in the provided schema from the car ad. "
+        "Return a strict JSON object that conforms to the schema. "
+        "If a value is not stated, use null; do not guess. "
+        "Use integers for price, year, mileage, num_owners, and cylinders. "
+        "Price must be the full selling price in USD, not a monthly payment "
+        "or down payment; use null if the full price is not stated. "
+        "Mileage must be in miles. "
+        "Year must be the vehicle's model year, not the posting year. "
+        "trim: return only the trim level, such as LX, Sport, or Limited. "
+        "body_type: you may infer this from a well-known make and model; "
+        "otherwise use the ad's stated body type or null. "
+        "drivetrain, transmission, fuel_type, exterior_color, title_status, "
+        "and condition: use the ad's attribute lines or clear statements. "
+        "A CVT counts as automatic. "
+        "leather_seats: true if leather seats or leather interior is stated; "
+        "false if cloth seats are stated; otherwise null. "
+        "sunroof, backup_camera, heated_seats, and navigation: true only "
+        "when explicitly listed as present, false only when explicitly "
+        "stated as absent, otherwise null. "
+        "city: use the town in parentheses after the price, such as "
+        "'(Avon)', or an explicitly stated vehicle location. "
+        "num_owners: return the stated number of previous owners. "
+        "accident_history: true if an accident is explicitly reported, "
+        "false if the ad explicitly states no accidents, otherwise null. "
+        "cylinders: return the stated cylinder count; V6 means 6 and V8 means 8. "
+        "needs_repair: true if the ad explicitly says repairs are needed, "
+        "false if it explicitly says no repairs are needed, otherwise null. "
+        "Do not add keys outside the schema."
     )
 
     # FIX: Combine instruction and text into one prompt string (SDK compatibility)
@@ -346,6 +414,25 @@ def llm_extract_http(request: Request):
                     "make": parsed.get("make"),
                     "model": parsed.get("model"),
                     "mileage": parsed.get("mileage"),
+                                        # A07: save the 18 new fields
+                    "trim": parsed.get("trim"),
+                    "body_type": parsed.get("body_type"),
+                    "drivetrain": parsed.get("drivetrain"),
+                    "transmission": parsed.get("transmission"),
+                    "fuel_type": parsed.get("fuel_type"),
+                    "exterior_color": parsed.get("exterior_color"),
+                    "title_status": parsed.get("title_status"),
+                    "condition": parsed.get("condition"),
+                    "leather_seats": parsed.get("leather_seats"),
+                    "city": parsed.get("city"),
+                    "sunroof": parsed.get("sunroof"),
+                    "backup_camera": parsed.get("backup_camera"),
+                    "heated_seats": parsed.get("heated_seats"),
+                    "navigation": parsed.get("navigation"),
+                    "num_owners": parsed.get("num_owners"),
+                    "accident_history": parsed.get("accident_history"),
+                    "cylinders": parsed.get("cylinders"),
+                    "needs_repair": parsed.get("needs_repair"),
                     "llm_provider": "vertex",
                     "llm_model": LLM_MODEL,
                     "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
