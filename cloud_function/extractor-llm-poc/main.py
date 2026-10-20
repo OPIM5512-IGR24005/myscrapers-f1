@@ -31,7 +31,8 @@ from google.api_core.exceptions import ResourceExhausted, InternalServerError, A
 PROJECT_ID           = os.getenv("PROJECT_ID", "")
 REGION               = os.getenv("REGION", "us-central1")
 BUCKET_NAME          = os.getenv("GCS_BUCKET", "")
-STRUCTURED_PREFIX    = os.getenv("STRUCTURED_PREFIX", "structured")
+STRUCTURED_PREFIX = os.getenv("STRUCTURED_PREFIX", "structured")
+SCRAPES_PREFIX = os.getenv("SCRAPES_PREFIX", "scrapes")
 LLM_PROVIDER         = os.getenv("LLM_PROVIDER", "vertex").lower()
 LLM_MODEL            = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 OVERWRITE_DEFAULT    = os.getenv("OVERWRITE", "false").lower() == "true"
@@ -79,38 +80,43 @@ def _get_vertex_model() -> GenerativeModel:
     return _CACHED_MODEL_OBJ
 
 
-def _list_structured_run_ids(bucket: str, structured_prefix: str) -> list[str]:
-    """
-    List 'structured/run_id=*/' directories and return normalized run_ids.
-    """
-    it = storage_client.list_blobs(bucket, prefix=f"{structured_prefix}/", delimiter="/")
+def _list_scrape_run_ids(bucket: str) -> list[str]:
+    """Find run folders directly under scrapes/."""
+    it = storage_client.list_blobs(
+        bucket,
+        prefix=f"{SCRAPES_PREFIX}/",
+        delimiter="/"
+    )
     for _ in it:
         pass
 
     runs = []
     for pref in getattr(it, "prefixes", []):
-        tail = pref.rstrip("/").split("/")[-1]
-        if tail.startswith("run_id="):
-            cand = tail.split("run_id=", 1)[1]
-            if RUN_ID_ISO_RE.match(cand) or RUN_ID_PLAIN_RE.match(cand):
-                runs.append(cand)
+        rid = pref.rstrip("/").split("/")[-1]
+        if RUN_ID_ISO_RE.match(rid) or RUN_ID_PLAIN_RE.match(rid):
+            runs.append(rid)
+
     return sorted(runs)
 
-
 def _llm_pending(bucket: str, run_id: str) -> bool:
-    """True if this run has regex JSONL inputs without matching LLM outputs yet."""
+    """True if any raw TXT listing lacks its matching LLM output."""
     bucket_obj = storage_client.bucket(bucket)
-    base = f"{STRUCTURED_PREFIX}/run_id={run_id}/"
-    n_in = 0
-    for b in bucket_obj.list_blobs(prefix=base + "jsonl/"):
-        if b.name.endswith(".jsonl"):
-            n_in += 1
-    n_out = 0
-    for b in bucket_obj.list_blobs(prefix=base + "jsonl_llm/"):
-        if b.name.endswith(".jsonl"):
-            n_out += 1
-    return n_in > n_out
+    prefix = f"{SCRAPES_PREFIX}/{run_id}/"
 
+    for blob in bucket_obj.list_blobs(prefix=prefix):
+        filename = blob.name[len(prefix):]
+        if "/" in filename or not filename.endswith(".txt"):
+            continue
+
+        post_id = filename[:-4]
+        out_key = (
+            f"{STRUCTURED_PREFIX}/run_id={run_id}/"
+            f"jsonl_llm/{post_id}_llm.jsonl"
+        )
+        if not bucket_obj.blob(out_key).exists():
+            return True
+
+    return False
 
 def _normalize_run_id_iso(run_id: str) -> str:
     """
@@ -128,19 +134,18 @@ def _normalize_run_id_iso(run_id: str) -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _list_per_listing_jsonl_for_run(bucket: str, run_id: str) -> list[str]:
-    """
-    Return *input* per-listing JSONL object names for a given run_id
-    (assumes inputs are in 'jsonl/').
-    """
-    prefix = f"{STRUCTURED_PREFIX}/run_id={run_id}/jsonl/"
+def _list_raw_txt_for_run(bucket: str, run_id: str) -> list[str]:
+    """List raw ad text files directly inside this scrape run."""
+    prefix = f"{SCRAPES_PREFIX}/{run_id}/"
     bucket_obj = storage_client.bucket(bucket)
     names = []
-    for b in bucket_obj.list_blobs(prefix=prefix):
-        if not b.name.endswith(".jsonl"):
-            continue
-        names.append(b.name)
-    return names
+
+    for blob in bucket_obj.list_blobs(prefix=prefix):
+        filename = blob.name[len(prefix):]
+        if "/" not in filename and filename.endswith(".txt"):
+            names.append(blob.name)
+
+    return sorted(names)
 
 
 def _download_text(blob_name: str) -> str:
@@ -347,7 +352,7 @@ def llm_extract_http(request: Request):
     if run_id:
         runs_to_do = [run_id]
     else:
-        runs = _list_structured_run_ids(BUCKET_NAME, STRUCTURED_PREFIX)
+        runs = _list_scrape_run_ids(BUCKET_NAME)
         if not runs:
             return jsonify({"ok": False, "error": f"no run_ids found under {STRUCTURED_PREFIX}/"}), 200
         runs_to_do = []
@@ -362,7 +367,7 @@ def llm_extract_http(request: Request):
 
     for rid in runs_to_do:
         structured_iso = _normalize_run_id_iso(rid)
-        inputs = _list_per_listing_jsonl_for_run(BUCKET_NAME, rid)
+        inputs = _list_raw_txt_for_run(BUCKET_NAME, rid)
         if not inputs:
             continue
         if max_files > 0:
@@ -375,24 +380,15 @@ def llm_extract_http(request: Request):
                 break   # cost cap reached; the rest are picked up next hour
             processed += 1
             try:
-                # Read the tiny JSON line (single record)
-                raw_line = _download_text(in_key).strip()
-                if not raw_line:
-                    raise ValueError("empty input jsonl")
-                base_rec = json.loads(raw_line)
+                # Get the listing ID directly from the raw TXT filename.
+                source_txt_key = in_key
+                post_id = in_key.rsplit("/", 1)[-1][:-4]
 
-                post_id = base_rec.get("post_id")
-                if not post_id:
-                    raise ValueError("missing post_id in input record")
-
-                source_txt_key = base_rec.get("source_txt")
-                if not source_txt_key:
-                    raise ValueError("missing source_txt in input record")
-
-                # Output path: uses 'jsonl_llm/' folder
-                out_prefix = in_key.rsplit("/", 2)[0] + "/jsonl_llm"
-                out_key = out_prefix + f"/{post_id}_llm.jsonl"
-
+                # Build the output path without using regex JSONL.
+                out_key = (
+                    f"{STRUCTURED_PREFIX}/run_id={rid}/"
+                    f"jsonl_llm/{post_id}_llm.jsonl"
+                )
                 if not overwrite and _blob_exists(out_key):
                     skipped += 1
                     continue
@@ -406,8 +402,8 @@ def llm_extract_http(request: Request):
                 # Compose final record
                 out_record = {
                     "post_id": post_id,
-                    "run_id": base_rec.get("run_id", rid),
-                    "scraped_at": base_rec.get("scraped_at", structured_iso),
+                    "run_id": rid,
+                    "scraped_at": structured_iso,
                     "source_txt": source_txt_key,
                     "price": parsed.get("price"),
                     "year": parsed.get("year"),
